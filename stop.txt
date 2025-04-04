@@ -1,0 +1,2 @@
+Upload this file to the Webdav server to stop it manually
+This file is not saved at the webdav location
