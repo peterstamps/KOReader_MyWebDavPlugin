@@ -104,3 +104,8 @@ UPDATE NOTES
 
 version: 1.0.1
 - first release, reused a lot of the code of my other plugin see https://github.com/peterstamps/KOReader_MyUploadPlugin
+
+version: 1.1
+- Copy to Webdav server failed when using larger files as the file was read in memorey before write happened. That is know changed and chunks are read and written.
+- Copy using the File Manager App on Android does not work okay. The file is copied with (zero) 0 bytes. Use an other app like Total Commander App with the Webdav plugin to copy files.
+

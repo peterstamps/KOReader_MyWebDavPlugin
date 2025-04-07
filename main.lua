@@ -304,7 +304,7 @@ local function handle_propfind(client_socket, path)
 	local files = {}
 	if result ==  'directory'  then
 		for file in lfs.dir(physical_path) do	
-		   print ("physical_path=", physical_path, ' file=', file)
+		   --print ("physical_path=", physical_path, ' file=', file)
 		   if not (file:lower():match("%." .. 'sdr' .. "$") or  isAnyPartHidden(file) ) then -- skip directories with extention .sdr and hidden ones	
 				local full_path = physical_path .. file	
 				local properties = get_webdav_properties(full_path)
@@ -565,27 +565,31 @@ local function handle_request(client_socket)
 			client_socket:close()
 			return
 		end	
-		local data = read_request_body(client_socket, headers)
-		--print(data)	
-		if data then
-		-- Save the content to a file
-			local file = io.open(full_filename, "wb")
-			if file then
-				-- Process the complete data
-				-- Write data to the file
-				file:write(data)
-				file:close()
-				-- Send back a successful response
-				webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp) 			 
-				client_socket:close()					
-			else
-				client_socket:send("HTTP/1.1 500 Internal Server Error\r\n\r\n")
-				client_socket:close()
-			end			  	
+		-- Read and Write the body of the request
+		-- Get the content length, which tells us how much data to expect
+		local content_length = tonumber(headers["content-length"]) or 0
+		if content_length > 0 then
+			-- Save the content to a file
+			local file = io.open(url_decode(full_filename), "wb")		
+			local body = ""   
+			-- Read the full body, either by chunks or until content-length is reached
+			local remaining = content_length
+			while remaining > 0 do
+			  local chunk_size = math.min(1024, remaining)
+			  local chunk, err = client_socket:receive(chunk_size)
+			  if not chunk then
+				webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp)     
+				break
+			  end
+			  file:write(chunk)
+			  remaining = remaining - #chunk
+			end 
+			file:close()   
+
+			webdav_send_response(client_socket, "201 Created", "application/xml", xml, auth_header_resp)  
 		else
 			webdav_send_response(client_socket, "200 Not Created", "application/xml", xml, auth_header_resp) 		
 		end			
-		
     else
 		webdav_send_response(client_socket, "405 Method Not Allowed", "application/xml", xml, auth_header_resp)    
     end
