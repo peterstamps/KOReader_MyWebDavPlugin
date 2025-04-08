@@ -13,17 +13,18 @@ This WEBDAV SERVER plugin allows you to use any Webdav client App or File Explor
 
 The default is Login username is "admin" with password "1234" (without the double quotes!).
 
-RECOMMENDED WEBDAV CLIENTS
+RECOMMENDED WEBDAV CLIENTS 
+NOTE: if you have problems then try another Webdav client. I had for example problems with WinSCP while Cyberduck worked fine on Windows 11.
+On my smart phone I use this  Total Commander App as it works perfect: https://play.google.com/store/search?q=total+commander+for+android&c=apps
+and the WebDav plugin: https://play.google.com/store/apps/details?id=com.ghisler.tcplugins.WebDAV
 
-Android Apps:  File Manager (preferred!), Total Commander with additional Webdav pluginb
-Windows 11:  Cyberduck (preferred), WinScp (but sometimes it requires extra refreshes and too many clicks to view results... strange)
+
+Android Apps:  Total Commander App with additional Webdav plugin (preferred!), File Manager App (but it some functions do not work properly See release notes!)
+Windows 11:  Cyberduck (preferred), WinScp (but sometimes it requires extra refreshes and too many clicks to view results... strange random behaviour)
 Linux: Nautilus, PCManFM (also a filemanager), others with WebDav support
 Mac: Cyberduck
 On All devices: KOReader, yes it has a WebDav client that you might already use: go to Cloud Storage under the main menu with the tools icon.
 If you use KOReader on Android you can access ebooks that are located on your ereader which runs KOreader with the Webdav Server!
-
-NOTE: if you have problems then try another Webdav client. I had for example problems with WinSCP while Cyberduck worked fine on Windows 11.
-On my smart phone I use this File Manager as it works perfect: https://play.google.com/store/apps/details?id=com.alphainventor.filemanager
 
 
 The starting point after login is a view of all content in the Home folder that you have chosen and set in you KOReader. Their is an exception: hidden files and folders ending with their name as .sdr are NOT shown at all.
@@ -106,6 +107,12 @@ version: 1.0.1
 - first release, reused a lot of the code of my other plugin see https://github.com/peterstamps/KOReader_MyUploadPlugin
 
 version: 1.1
-- Copy to Webdav server failed when using larger files as the file was read in memorey before write happened. That is know changed and chunks are read and written.
+- Copy to Webdav server failed when using larger files as the file was read in memory before write happened. That is now changed and chunks are read and written.
 - Copy using the File Manager App on Android does not work okay. The file is copied with (zero) 0 bytes. Use an other app like Total Commander App with the Webdav plugin to copy files.
+
+version: 1.2
+- A copy was actually treated as a move. That is now corrected. 
+- NOTE: The File Manager App on Android does not work okay for all actions! A Copy, Move or Download between Webdav server and a remote device does not work fine!. 
+  For example a file is copied with (zero) 0 bytes. 
+  The Total Commander App with the Webdav plugin on Andoid however works fine with all functions. Also Nautilus on Ubuntu and other will work fine.
 

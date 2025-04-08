@@ -184,15 +184,22 @@ local function escape_spaces_in_path(path)
       return path:gsub(" ", "%%20")
 end
 
--- Helper functions to handle file uploads
+-- URL decode
 local function url_decode(str)
-  return url.unescape(str)
-end
--- Helper functions to handle file downloads
-local function url_encode(str)
-  return url.escape(str)
+    str = str:gsub("+", " ")
+    str = str:gsub("%%(%x%x)", function(h)
+        return string.char(tonumber(h, 16))
+    end)
+    return str
 end
 
+-- Path resolve and sanitize
+local function resolve_path(url_path)
+    local decoded = url_decode(url_path or ""):gsub("\\", "/"):match("^[^%?]*")
+    decoded = decoded:gsub("/+", "/")
+    if decoded:find("%.%.") or decoded:find("\0") then return nil, "Invalid path" end
+    return decoded
+end
 
 local function isAnyPartHidden(path)
     -- Split the path into components (directories and filenames)
@@ -286,8 +293,8 @@ local function handle_propfind(client_socket, path)
 	result, check_err = check_file_or_directory(physical_path)
 	--print(result, check_err)
 	if check_err then 
-		webdav_send_response(client_socket, "404 Not Found", "application/xml", xml, auth_header_resp)  -- required for COPY and MOVE!!
-    end
+		return client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")   -- cannot use webdav_send_response here !
+	end	
 	--[[	if result then
 		print("variable dir contains a " .. result)
 	else
@@ -299,7 +306,7 @@ local function handle_propfind(client_socket, path)
     --  this part is required for Nautilus and other File explorting tools that support WebDav
 	local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
 	local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-    local xml_tmpl = [[<D:response><test0/><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname></D:prop></D:propstat></D:response>]] 				
+    local xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname></D:prop></D:propstat></D:response>]] 				
 	xml = xml .. string.format(xml_tmpl,  escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file) )      
 	local files = {}
 	if result ==  'directory'  then
@@ -313,14 +320,14 @@ local function handle_propfind(client_socket, path)
 						local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
 						local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
 						--print( path, display_name_file, extension)	
-						xml_tmpl = [[<D:response><test1/><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype/><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified></D:prop></D:propstat></D:response>]] 				
+						xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype/><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified></D:prop></D:propstat></D:response>]] 				
 						xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )			
 					end
 					if lfs.attributes(full_path, "mode") == "directory" then
 							local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
 							local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
 							--print( path, display_name_file, extension)	
-							xml_tmpl = [[<D:response><test3/><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
+							xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
 							xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getlastmodified)	
 					end
 				end
@@ -331,7 +338,7 @@ local function handle_propfind(client_socket, path)
 			local properties = get_webdav_properties(physical_path)
 			local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
 			local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-			xml_tmpl = [[<D:response><test4/><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
+			xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
 			xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )	
 		end
 	end
@@ -367,17 +374,21 @@ local function handle_copy(client_socket, path, headers)
     if destination then
         local src_path = url_decode(root_dir  .. path)
         local dst_path = url_decode(root_dir  .. string.sub(destination, #virtual_dir + 1, #destination) )
-		--print('src_path', src_path)
-		--print('dst_path', dst_path)    
-        local success, err = os.rename( src_path , dst_path)  -- Rename can be used for moving too
-        if success then
-            webdav_send_response(client_socket, "201 Created", "application/xml", xml, auth_header_resp) 
-        else
-			webdav_send_response(client_socket, "400 Bad Request", "application/xml", xml, auth_header_resp) 
-        end
+		local src = io.open(src_path, "rb")
+		if not src then return webdav_send_response(client_socket, "404 Not Found", "application/xml", xml, auth_header_resp) end
+		local dst = io.open(dst_path, "wb")
+		if not dst then src:close(); return webdav_send_response(client_socket, "500 Internal Server Error", "application/xml", xml, auth_header_resp) end
+		while true do
+			local chunk = src:read(1024)
+			if not chunk then break end
+			dst:write(chunk)
+		end
+		src:close(); dst:close()
+		webdav_send_response(client_socket, "201 Created", "application/xml", xml, auth_header_resp)
     else
         webdav_send_response(client_socket, "400 Bad Request", "application/xml", xml, auth_header_resp) 
     end
+	
 end
 
 -- Function to handle MOVE (move/rename file)
@@ -385,10 +396,10 @@ local function handle_move(client_socket, path, headers)
 	local physical_path, virt_path, virtual_dir = get_root_virt_paths(path)
     local destination = headers["destination"]
     if destination then
-        local src_path = url_decode(root_dir  .. path)
+        local src_path = root_dir  .. path
 		--print('src_path', src_path)
 		--print('dst_path', dst_path)           
-        local dst_path = url_decode(root_dir   .. string.sub(destination, #virtual_dir + 1, #destination) )
+        local dst_path = root_dir   .. string.sub(destination, #virtual_dir + 1, #destination) 
         local success, err = os.rename( src_path , dst_path)  -- Rename can be used for copying too
         if success then
 			webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp)        
@@ -403,58 +414,41 @@ end
 -- Function to handle DELETE (delete file)
 local function handle_delete(client_socket, path)
     local file_path = path:sub(2)
-    os.remove( url_decode(root_dir .. '/' .. file_path) )
+    os.remove(root_dir .. '/' .. file_path)
 	webdav_send_response(client_socket, "204 No Content", "application/xml", xml, auth_header_resp) 
 end
-
-local function read_request_body(client_socket, headers)
-    -- Read the body of the request
-    -- Get the content length, which tells us how much data to expect
-    local content_length = tonumber(headers["content-length"]) or 0
-    local body = ""   
-    -- Read the full body, either by chunks or until content-length is reached
-    local remaining = content_length
-    while remaining > 0 do
-      local chunk_size = math.min(1024, remaining)
-      local chunk, err = client_socket:receive(chunk_size)
-      if not chunk then
-        webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp)     
-        break
-      end
-      body = body .. chunk
-      remaining = remaining - #chunk
-    end    
-	if not body then
-        webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp)  
-		client_socket:close()
-		return
-	end
-	return body
-end 
 
 
 -- Handle file download
 local function webdav_download_file(file_name, client_socket)
 	--local file_path = file_name
 	local file_path=   root_dir .. file_name
-	--print (' in webdav_download_file=', file_path)
+	--print ('webdav_download_file=', file_path)
 	local mode = lfs.attributes(file_path, "mode")
 	if mode == "file" then
-        local file = io.open(file_path, "rb")
-        local properties = get_webdav_properties(file_path)
-        local file_data = file:read("*all")
-        file:close()
-		local path, file_to_download, extension = string.match(file_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
+		local file = io.open(resolve_path(file_path), "rb")
+		if not file then 
+			return  client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n") 
+		end
+		local properties = get_webdav_properties(resolve_path(file_path))
+		local size = file:seek("end")
+		--print('size=', size)
+		file:seek("set")
 		local response = "HTTP/1.1 200 OK\r\n"
-		--response = response .. "Content-Disposition: attachment; filename=" .. file_to_download .. "\r\n"    
 		response = response .. "Content-Type: application/octet-stream\r\n"   
 		response = response .. "Last-Modified: " .. properties.getlastmodified .. "\r\n"    
 		response = response .. "Date: " .. os.date("%a, %d %b %Y %H:%M:%S GMT") .. "\r\n"    
 		response = response .. "Server: MyUpload Server\r\n"    	
-		response = response .. "Content-Length: " .. #file_data .. "\r\n"
+		response = response .. "Content-Length: " .. tostring(size) .. "\r\n"
 		response = response .. "\r\n" -- End of headers
-		response = response .. file_data
-		client_socket:send(response)             
+		client_socket:send(response)   
+        -- send the data
+		while true do
+			local chunk = file:read(1024)
+			if not chunk then break end
+			client_socket:send(chunk)
+		end
+		file:close()	           
     else
 		local html = html_header("Error") .. 
     	[[
@@ -505,7 +499,7 @@ local function handle_request(client_socket)
     end
 	-- sanitise path 
 	if path then
-		path = url.unescape(path) -- remove url escaping from path e.g %20 
+		path = url_decode(path) -- remove url escaping from path e.g %20 
 	end
     
     if path == "/stop" then
@@ -540,14 +534,14 @@ local function handle_request(client_socket)
         end        
     elseif method == "HEAD" then
         -- List Directory (Basic WebDAV)
-        local dir_path = path  -- Remove the leading "/"
+        local dir_path = path   
         --print("HEAD, dir_path ", dir_path)
         local file = io.popen('ls "' .. root_dir .. path .. '"')
         local file_list = file:read("*a")
         --print(file_list)
         file:close()
         webdav_send_response(client_socket, "200 OK", "text/plain", file_list, auth_header_resp)          
-    elseif method == "PUT" then
+    elseif method == "PUT" then	
 		local physical_path, virt_path, virtual_dir = get_root_virt_paths(path) 
         -- Upload file
         --print ("path: ", path)
@@ -560,36 +554,30 @@ local function handle_request(client_socket)
 		end
 		local full_filename = root_dir .. file_path
         --print ("full_filename: ", full_filename)	
-		if not full_filename then
+		if not full_filename then		
 			client_socket:send("HTTP/1.1 500 Internal Server Error\r\n\r\n")
 			client_socket:close()
 			return
 		end	
 		-- Read and Write the body of the request
 		-- Get the content length, which tells us how much data to expect
-		local content_length = tonumber(headers["content-length"]) or 0
-		if content_length > 0 then
-			-- Save the content to a file
-			local file = io.open(url_decode(full_filename), "wb")		
-			local body = ""   
-			-- Read the full body, either by chunks or until content-length is reached
-			local remaining = content_length
-			while remaining > 0 do
-			  local chunk_size = math.min(1024, remaining)
-			  local chunk, err = client_socket:receive(chunk_size)
-			  if not chunk then
-				webdav_send_response(client_socket, "200 OK", "application/xml", xml, auth_header_resp)     
-				break
-			  end
-			  file:write(chunk)
-			  remaining = remaining - #chunk
-			end 
-			file:close()   
-
-			webdav_send_response(client_socket, "201 Created", "application/xml", xml, auth_header_resp)  
-		else
-			webdav_send_response(client_socket, "200 Not Created", "application/xml", xml, auth_header_resp) 		
-		end			
+		local length = tonumber(headers["content-length"])
+		if not length then 		
+			return webdav_send_response(client_socket, "411 Length Required", "application/xml", xml, auth_header_resp)
+		end
+		local file = io.open(full_filename, "wb")
+		if not file then 	
+			return webdav_send_response(client_socket, "500 Internal Server Error", "application/xml", xml, auth_header_resp) 
+		end
+		local received = 0	
+		while received < length do
+			local chunk = client_socket:receive(math.min(1024, length - received))
+			if not chunk then break end
+			file:write(chunk)
+			received = received + #chunk
+		end
+		file:close()
+		webdav_send_response(client_socket, "201 Created", "application/xml", xml, auth_header_resp)			
     else
 		webdav_send_response(client_socket, "405 Method Not Allowed", "application/xml", xml, auth_header_resp)    
     end
