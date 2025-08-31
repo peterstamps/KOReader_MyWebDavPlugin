@@ -739,7 +739,7 @@ function MyWebDav:addToMainMenu(menu_items)
 	end
     menu_items.MyWebDav = {
         text = _("WebDav Server"),
-        -- sorting_hint = "more_tools",
+        sorting_hint = "network",
         sub_item_table = { 
 		    {  
                 text = "Is Wifi ON? Then start WebDav", 
