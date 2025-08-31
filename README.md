@@ -116,3 +116,5 @@ version: 1.2
   For example a file is copied with (zero) 0 bytes. 
   The Total Commander App with the Webdav plugin on Andoid however works fine with all functions. Also Nautilus on Ubuntu and other will work fine.
 
+version: 1.3
+- The ENTRY NEW: WebDav server has been moved under the Clogs icon , Network!. Word NEW is then dropped!
