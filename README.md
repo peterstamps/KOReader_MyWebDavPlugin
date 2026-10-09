@@ -122,4 +122,6 @@ version: 1.3
 version: 1.4
  - Fixes for password saving, UI freeze, large PUT timeouts, PROPFIND/DELETE/HEAD, plus Range/Depth/LOCK support - #2
    Many thanks to TvariKot who brought all these improvements and was so kind to let me merge this and I adapted a few small things like connection time out now 240 for large libraries and default root directory is /mnt/onboard  (Kobo's default) ! 
+
+IMPORTANT: Uploading a file which has a name with "#" in it will fail with an error message. However the file will be still uploaded but with a truncated name! Only the characters before the # (hash) are used in the new filename.  So "My Example #001 file.epub"  will become "My Example " on your device.
    
