@@ -118,3 +118,7 @@ version: 1.2
 
 version: 1.3
 - The ENTRY NEW: WebDav server has been moved under the Clogs icon , Network!. Word NEW is then dropped!
+
+version: 1.4
+ - Fixes for password saving, UI freeze, large PUT timeouts, PROPFIND/DELETE/HEAD, plus Range/Depth/LOCK support - #2
+   Many thanks to TvariKot who brought all these improvements and was so kind to let me merge this! 
