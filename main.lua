@@ -183,6 +183,177 @@ local function escape_spaces_in_path(path)
 	return path:gsub(" ", "%%20")
 end
 
+-- URL decode
+local function url_decode(str)
+    str = str:gsub("+", " ")
+    str = str:gsub("%%(%x%x)", function(h)
+        return string.char(tonumber(h, 16))
+    end)
+    return str
+end
+
+
+-- Path resolve and sanitize
+local function resolve_path(url_path)
+    local decoded = url_decode(url_path or ""):gsub("\\", "/"):match("^[^%?]*")
+    decoded = decoded:gsub("/+", "/")
+    if decoded:find("%.%.") or decoded:find("\0") then return nil, "Invalid path" end
+    return decoded
+end
+
+local function isAnyPartHidden(path)
+    -- Split the path into components (directories and filenames)
+    for part in path:gmatch("[^/\\]+") do
+        -- Check if any part starts with a dot (hidden file/folder)
+        if part:sub(1, 1) == "." then
+            return true  -- Found a hidden part in the path
+        end
+    end
+    return false  -- No hidden parts in the path
+end
+
+-- Function to get WebDAV-like properties for a file
+local function get_webdav_properties(file_path)
+    -- Get file attributes using lfs.attributes
+    local attributes = lfs.attributes(file_path)  
+    if attributes then
+        -- Get file size (similar to getcontentlength)
+        local file_size = attributes.size
+        -- Get last modified date (similar to getlastmodified)
+        local last_modified = os.date("%a, %d %b %Y %H:%M:%S GMT", attributes.modification)
+        -- Return the properties
+        return {
+            getcontentlength = file_size,
+            getlastmodified = last_modified
+        }
+    else
+        -- Return nil if the file doesn't exist
+        return nil
+    end
+end
+
+-- Create a simple  response with proper headers, body and auth_header_resp
+local function webdav_send_response(client, status, content_type, xml, auth_header_resp)
+    local response = "HTTP/1.1 " .. status .. "\r\n"
+    response = response .. "Content-Type: " .. content_type .. ';charset: "utf-8"\r\n'    
+    -- If a authorization header is provided, include it in the response headers
+    if auth_header_resp then
+        response = response .. auth_header_resp .. "\r\n" 
+    end
+    response = response .. "Accept-Encoding: gzip, deflate\r\n"
+    response = response .. "Connection: Close\r\n"
+    --response = response .. "Depth: 10\r\n"
+    response = response .. "Apply-To-Redirect-Ref: T\r\n"
+    if xml then
+        response = response .. "Content-Length: " .. #escape_ampersands(xml) .. "\r\n"
+	end
+    response = response .. "\r\n" -- End of headers
+    if xml then
+		response = response .. escape_ampersands(xml) -- add the body content
+	end
+    client:send(response)
+end
+
+-- Helper function to construct root and virtual paths
+local function get_root_virt_paths(path)
+    local file_path = path
+    local virtual_dir = 'http://' .. webdav_parms_ip_address .. ":" ..  tostring(port)
+    if file_path then
+		physical_path = root_dir  .. file_path
+		virtual_path =  virtual_dir .. file_path
+	else
+		physical_path = root_dir
+		virtual_path =  virtual_dir 
+	end   
+	if string.len(physical_path) == 0  then
+	  physical_path = '.'
+	end
+    return physical_path, virt_path, virtual_dir
+end
+
+-- Function to handle PROPFIND (listing files)
+local function handle_propfind(client_socket, path)
+	local physical_path, virt_path, virtual_dir = get_root_virt_paths(path)
+	local function check_file_or_directory(X)
+		if not X then 
+			return nil, "No file or directory specified"
+		end
+		local attr = lfs.attributes(X)		
+		if not attr then
+			return nil, "No such file or directory"
+		end
+		if attr.mode == "directory" then
+			return "directory"
+		elseif attr.mode == "file" then
+			return "file"
+		else
+			return "unknown"
+		end
+	end	
+	result, check_err = check_file_or_directory(physical_path)
+	--print(result, check_err)
+	if check_err then 
+		return client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")   -- cannot use webdav_send_response here !
+	end	
+	--[[	if result then
+		print("variable dir contains a " .. result)
+	else
+		print("Error: " .. check_err)
+	end
+	-]]
+    local xml = '<?xml version="1.0" encoding="utf-8"?>'
+    xml = xml .. '<D:multistatus xmlns:D="DAV:"  xmlns:Z="urn:schemas-microsoft-com:">'
+    --  this part is required for Nautilus and other File explorting tools that support WebDav
+	local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
+	local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
+    local xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname></D:prop></D:propstat></D:response>]] 				
+	xml = xml .. string.format(xml_tmpl,  escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file) )      
+	local files = {}
+	if result ==  'directory'  then
+		for file in lfs.dir(physical_path) do	
+		   --print ("physical_path=", physical_path, ' file=', file)
+		   if not (file:lower():match("%." .. 'sdr' .. "$") or  isAnyPartHidden(file) ) then -- skip directories with extention .sdr and hidden ones	
+				local full_path = physical_path .. file	
+				local properties = get_webdav_properties(full_path)
+				if file ~= "." and file ~= ".." then
+					if lfs.attributes(full_path, "mode") == "file" then
+						local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
+						local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
+						--print( path, display_name_file, extension)	
+						xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype/><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified></D:prop></D:propstat></D:response>]] 				
+						xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )			
+					end
+					if lfs.attributes(full_path, "mode") == "directory" then
+							local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
+							local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
+							--print( path, display_name_file, extension)	
+							xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
+							xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getlastmodified)	
+					end
+				end
+			end
+		 end
+	elseif result ==  'file'  then
+		if not (physical_path:lower():match("%." .. 'sdr' .. "$") or  isAnyPartHidden(physical_path) ) then -- skip directories with extention .sdr and hidden ones
+			local properties = get_webdav_properties(physical_path)
+			local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
+			local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
+			xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
+			xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )	
+		end
+	end
+    xml = xml .. "</D:multistatus>"
+    -- print (xml)
+	--local file = io.open("/home/peter/Downloads/xmlresponse.xml", "wb")
+	-- Process the complete data
+	-- Write data to the file
+	--file:write(escape_ampersands(xml))
+	--file:close()	 
+	webdav_send_response(client_socket, "207 Multi-Status", "application/xml", xml, auth_header_resp)  
+end
+
+
+
 -- MKCOL: create directory
 local function handle_mkcol(client_socket, path)
 	local physical_path = get_root_virt_paths(path)
@@ -799,7 +970,7 @@ local function server_tick()
 	if server_socket then
 		local client_socket = server_socket:accept()
 		if client_socket then
-			client_socket:settimeout(120)
+			client_socket:settimeout(240)
 			handle_request(client_socket)
 		end
 	end
@@ -1304,7 +1475,7 @@ if G_reader_settings:hasNot("webdav_parms") then
 		seconds_runtime = tonumber(default_seconds_runtime),
 		username = tostring(default_username),
 		password = tostring(default_password),
-		root_dir = "/mnt/ext1",
+		root_dir = "/mnt/onboard",
 	})
 end
 
