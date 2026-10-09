@@ -121,4 +121,5 @@ version: 1.3
 
 version: 1.4
  - Fixes for password saving, UI freeze, large PUT timeouts, PROPFIND/DELETE/HEAD, plus Range/Depth/LOCK support - #2
-   Many thanks to TvariKot who brought all these improvements and was so kind to let me merge this! 
+   Many thanks to TvariKot who brought all these improvements and was so kind to let me merge this and I adapted a few small things like connection time out now 240 for large libraries and default root directory is /mnt/onboard  (Kobo's default) ! 
+   
