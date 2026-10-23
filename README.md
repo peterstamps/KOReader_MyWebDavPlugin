@@ -84,7 +84,7 @@ If you use the standard available Hotspot function of the smart phone of your fr
 
 See the github ScreenPrints folder to get an steb-by-step overview.
 
-The SCREENPRINTS version 1.5 onwards folder shows this scenario
+The "WebDav plugin v1.5 step by step walktru (xx).png" files show this scenario:
 - The home folder contains a set of Author folders and in each folder one or more ebook (.epub) titles
 - The steps to go to the WebDav plugin are show
 - The WebDav Server is started and a popup appears with a small countdown message at the top
@@ -192,5 +192,5 @@ The default root directory set in the settings file will be /mnt/onboard (that i
 This will allow you to see all books on your native Kobo installation as well.
 When you want a different default Root setting then use the settings in the plgin to navigate to the correct folder and Long press to set it.
 Complete new screenprints are created which show the described scenario (see above).
-See github sub folder "SCREENPRINTS version 1.5 onwards"
+See github the ""WebDav plugin v1.5 step by step walktru (xx).png"" files.
 
