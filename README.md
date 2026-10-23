@@ -192,5 +192,5 @@ The default root directory set in the settings file will be /mnt/onboard (that i
 This will allow you to see all books on your native Kobo installation as well.
 When you want a different default Root setting then use the settings in the plgin to navigate to the correct folder and Long press to set it.
 Complete new screenprints are created which show the described scenario (see above).
-See github the ""WebDav plugin v1.5 step by step walktru (xx).png"" files.
+See github the ""WebDav plugin v1.5 step by step walktru (xx).png"" files. Hint: start with png 10 back to 01....!
 
