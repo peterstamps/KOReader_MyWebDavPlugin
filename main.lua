@@ -2,7 +2,7 @@
 MyWebDav — WebDAV server plugin for KOReader.
 
 Features:
-- Non-blocking server loop (UIManager:scheduleIn)
+- Non-blocking server loop with pcall-guarded tick
 - Blocking dialog with Stop button
 - Live countdown timer notification
 - Runtime accepts seconds (600) or MM:SS (12:30)
@@ -10,12 +10,12 @@ Features:
 - Manual IP mode (optional)
 - Basic authentication (RFC 7617)
 - HTTP Range support for downloads
-- Recursive DELETE
+- Recursive DELETE with root protection
+- Path traversal protection across all methods
 - LOCK / UNLOCK stubs
 
 @module MyWebDav
---]]
---
+--]]--
 
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
@@ -34,15 +34,11 @@ local os = require("os")
 local string = require("string")
 local mime = require("mime")
 local lfs = require("libs/libkoreader-lfs")
+local util = require("util")
 
 -- Load reader settings if not already available
 if G_reader_settings == nil then
 	G_reader_settings = require("luasettings"):open(DataStorage:getDataDir() .. "/settings.reader.lua")
-end
-
--- Default home directory (used by KOReader, not directly by this plugin)
-if G_reader_settings:hasNot("home_dir") then
-	G_reader_settings:saveSetting("home_dir", ".")
 end
 
 -- Root directory exposed over WebDAV. Overridden by saved settings below.
@@ -63,6 +59,9 @@ server_dialog = nil
 -- True = use user-supplied IP, false = use auto-detected
 user_ip_enabled = false
 
+-- Kindle-only: true while iptables rules are in place
+kindle_firewall_open = false
+
 -- Reference to KOReader UI (set in MyWebDav:init)
 MyWebDav_ui = nil
 
@@ -82,7 +81,6 @@ local function is_wifi_on()
 end
 
 -- Returns true if battery charge is below the given threshold (percent).
--- Returns nil if the power device is not available.
 local function is_battery_low(threshold)
 	threshold = threshold or 20
 	local ok, powerd = pcall(function()
@@ -101,12 +99,12 @@ local function is_battery_low(threshold)
 end
 
 -- ---------------------------------------------------------------------------
--- Minimal HTML wrappers for browser responses
+-- Minimal HTML wrappers
 -- ---------------------------------------------------------------------------
 
 local function html_header(title)
 	return [[
-            <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -121,7 +119,7 @@ local function html_header(title)
 <body>
     <div class="container">
     <h1>]] .. title .. [[</h1>
-    ]]
+]]
 end
 
 local function html_footer()
@@ -129,156 +127,181 @@ local function html_footer()
     </div>
     </body>
     </html>
-    ]]
+]]
+end
+
+-- ---------------------------------------------------------------------------
+-- XML / URL escaping
+-- ---------------------------------------------------------------------------
+
+-- Escape a plain-text string for safe inclusion in XML content.
+local function xml_escape(s)
+	s = tostring(s or "")
+	s = s:gsub("&", "&amp;")
+	s = s:gsub("<", "&lt;")
+	s = s:gsub(">", "&gt;")
+	s = s:gsub('"', "&quot;")
+	return s
+end
+
+-- Encode a filesystem path for use inside an XML <D:href> element.
+-- Keeps ":" literal so the http://host:port prefix stays intact.
+local function url_encode_path(p)
+	p = tostring(p or "")
+	return (p:gsub("([^%w%-%._~:/])", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
 end
 
 -- ---------------------------------------------------------------------------
 -- Basic authentication (RFC 7617)
 -- ---------------------------------------------------------------------------
 
-local function base64encode(username, password)
-	local credentials = username .. ":" .. password
-	return "Authorization: Basic " .. mime.b64(credentials)
-end
-
 local function check_authentication(headers)
 	local auth_header = headers["authorization"]
 	if not auth_header then
 		return false
 	end
-	local auth_type, encoded_credentials = string.match(auth_header, "^(%S+)%s+(%S+)$")
+	local auth_type, encoded_credentials = auth_header:match("^(%S+)%s+(%S+)$")
 	if auth_type ~= "Basic" then
 		return false
 	end
-	local decoded_credentials = mime.unb64(encoded_credentials)
-	local user, pass = string.match(decoded_credentials, "(%S+):(%S+)")
+
+	local ok_dec, decoded_credentials = pcall(mime.unb64, encoded_credentials)
+	if not ok_dec or not decoded_credentials then
+		return false
+	end
+
+	-- Password may contain colons or spaces; split only on the first colon.
+	local user, pass = decoded_credentials:match("^([^:]*):(.*)$")
+	if user == nil then
+		return false
+	end
 
 	local webdav_parms = G_reader_settings:readSetting("webdav_parms")
-	local webdav_username, webdav_password
-	if webdav_parms then
-		webdav_username = tostring(webdav_parms["username"])
-		webdav_password = tostring(webdav_parms["password"])
+	if not webdav_parms then
+		return false
 	end
+	local stored_user = tostring(webdav_parms["username"] or "")
+	local stored_pass = tostring(webdav_parms["password"] or "")
 
-	if tostring(user) == tostring(webdav_username) and tostring(pass) == tostring(webdav_password) then
-		auth_header_resp = base64encode(user, pass)
-		return true
-	end
-	auth_header_resp = ""
-	return false
+	return user == stored_user and pass == stored_pass
 end
 
--- Escape ampersands for XML payloads
-local function escape_ampersands(xml_str)
-	xml_str = xml_str:gsub("([^<>&]*)&(.-)([^<>&]*)", function(before, mid, after)
-		if not mid:match("^[a-zA-Z#][a-zA-Z0-9]*$") then
-			return before .. "&amp;" .. after
-		end
-		return before .. "&" .. mid .. after
-	end)
-	return xml_str
-end
-
-local function escape_spaces_in_path(path)
-	return path:gsub(" ", "%%20")
-end
-
--- URL decode
-local function url_decode(str)
-    str = str:gsub("+", " ")
-    str = str:gsub("%%(%x%x)", function(h)
-        return string.char(tonumber(h, 16))
-    end)
-    return str
-end
-
-
--- Path resolve and sanitize
+-- Resolve a client-supplied URL path into a physical path inside root_dir.
+-- Returns (full_path, rel_path). ".." segments are swallowed, so the result
+-- is always inside root_dir. Decodes the URL path exactly once.
 local function resolve_path(url_path)
-    local decoded = url_decode(url_path or ""):gsub("\\", "/"):match("^[^%?]*")
-    decoded = decoded:gsub("/+", "/")
-    if decoded:find("%.%.") or decoded:find("\0") then return nil, "Invalid path" end
-    return decoded
+	local decoded = util.urlDecode(url_path or "")
+	-- Strip any query string
+	decoded = decoded:match("^[^%?]*") or ""
+	-- Normalize separators
+	decoded = decoded:gsub("\\", "/")
+
+	local parts = {}
+	for seg in decoded:gmatch("[^/]+") do
+		if seg == ".." then
+			if #parts > 0 then
+				table.remove(parts)
+			end
+		elseif seg ~= "." then
+			table.insert(parts, seg)
+		end
+	end
+	local rel = "/" .. table.concat(parts, "/")
+
+	local base = root_dir:gsub("/+$", "")
+	if rel == "/" then
+		return base, "/"
+	end
+	return base .. rel, rel
+end
+
+-- Extract a URL path from a Destination header.
+-- Accepts "http://host:port/path" and bare "/path".
+local function path_from_destination(dest)
+	if not dest then
+		return nil
+	end
+	local p = dest:match("^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+(/.*)$")
+	if not p then
+		p = dest:match("^(/.*)$")
+	end
+	return p
 end
 
 local function isAnyPartHidden(path)
-    -- Split the path into components (directories and filenames)
-    for part in path:gmatch("[^/\\]+") do
-        -- Check if any part starts with a dot (hidden file/folder)
-        if part:sub(1, 1) == "." then
-            return true  -- Found a hidden part in the path
-        end
-    end
-    return false  -- No hidden parts in the path
+	for part in path:gmatch("[^/\\]+") do
+		if part:sub(1, 1) == "." then
+			return true
+		end
+	end
+	return false
 end
 
--- Function to get WebDAV-like properties for a file
+-- Returns WebDAV properties (size, modification time) for a path, or nil.
 local function get_webdav_properties(file_path)
-    -- Get file attributes using lfs.attributes
-    local attributes = lfs.attributes(file_path)  
-    if attributes then
-        -- Get file size (similar to getcontentlength)
-        local file_size = attributes.size
-        -- Get last modified date (similar to getlastmodified)
-        local last_modified = os.date("%a, %d %b %Y %H:%M:%S GMT", attributes.modification)
-        -- Return the properties
-        return {
-            getcontentlength = file_size,
-            getlastmodified = last_modified
-        }
-    else
-        -- Return nil if the file doesn't exist
-        return nil
-    end
+	local attributes = lfs.attributes(file_path)
+	if not attributes then
+		return nil
+	end
+	return {
+		getcontentlength = attributes.size or 0,
+		getlastmodified = os.date("!%a, %d %b %Y %H:%M:%S GMT", attributes.modification),
+	}
 end
 
--- Create a simple  response with proper headers, body and auth_header_resp
-local function webdav_send_response(client, status, content_type, xml, auth_header_resp)
-    local response = "HTTP/1.1 " .. status .. "\r\n"
-    response = response .. "Content-Type: " .. content_type .. ';charset: "utf-8"\r\n'    
-    -- If a authorization header is provided, include it in the response headers
-    if auth_header_resp then
-        response = response .. auth_header_resp .. "\r\n" 
-    end
-    response = response .. "Accept-Encoding: gzip, deflate\r\n"
-    response = response .. "Connection: Close\r\n"
-    --response = response .. "Depth: 10\r\n"
-    response = response .. "Apply-To-Redirect-Ref: T\r\n"
-    if xml then
-        response = response .. "Content-Length: " .. #escape_ampersands(xml) .. "\r\n"
+-- Send an HTTP response with proper headers and optional body.
+local function webdav_send_response(client, status, content_type, body)
+	local response = "HTTP/1.1 " .. status .. "\r\n"
+	response = response .. "Content-Type: " .. content_type .. '; charset="utf-8"\r\n'
+	response = response .. "Accept-Encoding: gzip, deflate\r\n"
+	response = response .. "Connection: Close\r\n"
+	response = response .. "Apply-To-Redirect-Ref: T\r\n"
+	if body then
+		response = response .. "Content-Length: " .. #body .. "\r\n"
 	end
-    response = response .. "\r\n" -- End of headers
-    if xml then
-		response = response .. escape_ampersands(xml) -- add the body content
+	response = response .. "\r\n"
+	if body then
+		response = response .. body
 	end
-    client:send(response)
+	client:send(response)
 end
 
--- Helper function to construct root and virtual paths
-local function get_root_virt_paths(path)
-    local file_path = path
-    local virtual_dir = 'http://' .. webdav_parms_ip_address .. ":" ..  tostring(port)
-    if file_path then
-		physical_path = root_dir  .. file_path
-		virtual_path =  virtual_dir .. file_path
-	else
-		physical_path = root_dir
-		virtual_path =  virtual_dir 
-	end   
-	if string.len(physical_path) == 0  then
-	  physical_path = '.'
+-- Build virtual (HTTP) paths for a normalized relative URL path.
+local function get_root_virt_paths(rel)
+	local virtual_dir = "http://" .. webdav_parms_ip_address .. ":" .. tostring(port)
+	if not rel or rel == "" or rel == "/" then
+		return root_dir, virtual_dir, virtual_dir
 	end
-    return physical_path, virt_path, virtual_dir
+	return root_dir .. rel, virtual_dir .. rel, virtual_dir
 end
 
--- Function to handle PROPFIND (listing files)
-local function handle_propfind(client_socket, path)
-	local physical_path, virt_path, virtual_dir = get_root_virt_paths(path)
+-- Join a directory and a filename with exactly one separator.
+local function join_path(dir, name)
+	if dir:sub(-1) == "/" then
+		return dir .. name
+	end
+	return dir .. "/" .. name
+end
+
+-- PROPFIND: list directory contents (honours Depth header)
+local function handle_propfind(client_socket, path, headers)
+	local _, rel = resolve_path(path)
+	local physical_path, _, virtual_dir = get_root_virt_paths(rel)
+
+	-- Depth: "0" = only the resource, "1" (default) = resource + children
+	local depth = (headers and headers["depth"]) or "1"
+	depth = depth:lower()
+	if depth ~= "0" then
+		depth = "1"
+	end
+
 	local function check_file_or_directory(X)
-		if not X then 
+		if not X then
 			return nil, "No file or directory specified"
 		end
-		local attr = lfs.attributes(X)		
+		local attr = lfs.attributes(X)
 		if not attr then
 			return nil, "No such file or directory"
 		end
@@ -286,110 +309,128 @@ local function handle_propfind(client_socket, path)
 			return "directory"
 		elseif attr.mode == "file" then
 			return "file"
-		else
-			return "unknown"
 		end
-	end	
-	result, check_err = check_file_or_directory(physical_path)
-	--print(result, check_err)
-	if check_err then 
-		return client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")   -- cannot use webdav_send_response here !
-	end	
-	--[[	if result then
-		print("variable dir contains a " .. result)
-	else
-		print("Error: " .. check_err)
+		return "unknown"
 	end
-	-]]
-    local xml = '<?xml version="1.0" encoding="utf-8"?>'
-    xml = xml .. '<D:multistatus xmlns:D="DAV:"  xmlns:Z="urn:schemas-microsoft-com:">'
-    --  this part is required for Nautilus and other File explorting tools that support WebDav
+
+	local result, check_err = check_file_or_directory(physical_path)
+	if check_err then
+		return client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")
+	end
+
+	local xml = '<?xml version="1.0" encoding="utf-8"?>'
+	xml = xml .. '<D:multistatus xmlns:D="DAV:"  xmlns:Z="urn:schemas-microsoft-com:">'
+
 	local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
-	local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-    local xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname></D:prop></D:propstat></D:response>]] 				
-	xml = xml .. string.format(xml_tmpl,  escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file) )      
-	local files = {}
-	if result ==  'directory'  then
-		for file in lfs.dir(physical_path) do	
-		   --print ("physical_path=", physical_path, ' file=', file)
-		   if not (file:lower():match("%." .. 'sdr' .. "$") or  isAnyPartHidden(file) ) then -- skip directories with extention .sdr and hidden ones	
-				local full_path = physical_path .. file	
+	if result == "directory" and href_file:sub(-1) ~= "/" then
+		href_file = href_file .. "/"
+	end
+	local _, display_name_file = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")
+	local xml_tmpl =
+		[[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname></D:prop></D:propstat></D:response>]]
+	xml = xml .. string.format(xml_tmpl, url_encode_path(href_file), xml_escape(display_name_file))
+
+	if depth == "0" then
+		xml = xml .. "</D:multistatus>"
+		return webdav_send_response(client_socket, "207 Multi-Status", "application/xml", xml)
+	end
+
+	if result == "directory" then
+		for file in lfs.dir(physical_path) do
+			if not (file:lower():match("%." .. "sdr" .. "$") or isAnyPartHidden(file)) then
+				local full_path = join_path(physical_path, file)
 				local properties = get_webdav_properties(full_path)
-				if file ~= "." and file ~= ".." then
-					if lfs.attributes(full_path, "mode") == "file" then
-						local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
-						local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-						--print( path, display_name_file, extension)	
-						xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype/><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified></D:prop></D:propstat></D:response>]] 				
-						xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )			
+				if file ~= "." and file ~= ".." and properties then
+					local mode = lfs.attributes(full_path, "mode")
+					local dname = file
+					local href = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
+					if mode == "directory" then
+						href = href .. "/"
 					end
-					if lfs.attributes(full_path, "mode") == "directory" then
-							local href_file = virtual_dir .. string.sub(full_path, #root_dir + 1, #full_path)
-							local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-							--print( path, display_name_file, extension)	
-							xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
-							xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getlastmodified)	
+					if mode == "file" then
+						xml_tmpl =
+							[[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype/><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified></D:prop></D:propstat></D:response>]]
+						xml = xml
+							.. string.format(
+								xml_tmpl,
+								url_encode_path(href),
+								xml_escape(dname),
+								properties.getcontentlength,
+								properties.getlastmodified
+							)
+					elseif mode == "directory" then
+						xml_tmpl =
+							[[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>%s</D:displayname><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]]
+						xml = xml
+							.. string.format(
+								xml_tmpl,
+								url_encode_path(href),
+								xml_escape(dname),
+								properties.getlastmodified
+							)
 					end
 				end
 			end
-		 end
-	elseif result ==  'file'  then
-		if not (physical_path:lower():match("%." .. 'sdr' .. "$") or  isAnyPartHidden(physical_path) ) then -- skip directories with extention .sdr and hidden ones
+		end
+	elseif result == "file" then
+		if not (physical_path:lower():match("%." .. "sdr" .. "$") or isAnyPartHidden(physical_path)) then
 			local properties = get_webdav_properties(physical_path)
-			local href_file = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
-			local path, display_name_file, extension = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")	
-			xml_tmpl = [[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]] 				
-			xml = xml .. string.format(xml_tmpl, escape_spaces_in_path(href_file), escape_spaces_in_path(display_name_file), properties.getcontentlength, properties.getlastmodified )	
+			local href = virtual_dir .. string.sub(physical_path, #root_dir + 1, #physical_path)
+			local _, dname = string.match(physical_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")
+			xml_tmpl =
+				[[<D:response><D:href>%s</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:displayname>%s</D:displayname><D:getcontentlength>%s</D:getcontentlength><D:getlastmodified>%s</D:getlastmodified><D:getcontenttype>application/octet-stream</D:getcontenttype></D:prop></D:propstat></D:response>]]
+			xml = xml
+				.. string.format(
+					xml_tmpl,
+					url_encode_path(href),
+					xml_escape(dname),
+					properties.getcontentlength,
+					properties.getlastmodified
+				)
 		end
 	end
-    xml = xml .. "</D:multistatus>"
-    -- print (xml)
-	--local file = io.open("/home/peter/Downloads/xmlresponse.xml", "wb")
-	-- Process the complete data
-	-- Write data to the file
-	--file:write(escape_ampersands(xml))
-	--file:close()	 
-	webdav_send_response(client_socket, "207 Multi-Status", "application/xml", xml, auth_header_resp)  
+	xml = xml .. "</D:multistatus>"
+	webdav_send_response(client_socket, "207 Multi-Status", "application/xml", xml)
 end
-
-
 
 -- MKCOL: create directory
 local function handle_mkcol(client_socket, path)
-	local physical_path = get_root_virt_paths(path)
-	local ok = lfs.mkdir(physical_path)
+	local full_path, rel = resolve_path(path)
+	if rel == "/" then
+		return webdav_send_response(client_socket, "405 Method Not Allowed", "application/xml", nil)
+	end
+	local ok = lfs.mkdir(full_path)
 	if ok then
-		webdav_send_response(client_socket, "201 Created", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "201 Created", "application/xml", nil)
 	else
-		webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil)
 	end
 end
 
 -- COPY: copy a file
 local function handle_copy(client_socket, path, headers)
-	local _, _, virtual_dir = get_root_virt_paths(path)
-	local destination = headers["destination"]
-	if not destination then
-		return webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil, auth_header_resp)
+	local src_path, src_rel = resolve_path(path)
+	if src_rel == "/" then
+		return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
 	end
 
-	local src_path = url_decode(root_dir .. path)
-	local dst_path = url_decode(root_dir .. string.sub(destination, #virtual_dir + 1, #destination))
+	local dst_url = path_from_destination(headers["destination"])
+	if not dst_url then
+		return webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil)
+	end
+	local dst_path, dst_rel = resolve_path(dst_url)
+	if dst_rel == "/" then
+		return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
+	end
 
 	local src = io.open(src_path, "rb")
 	if not src then
-		return webdav_send_response(client_socket, "404 Not Found", "application/xml", nil, auth_header_resp)
+		return webdav_send_response(client_socket, "404 Not Found", "application/xml", nil)
 	end
 	local dst = io.open(dst_path, "wb")
 	if not dst then
 		src:close()
-		return webdav_send_response(
-			client_socket,
-			"500 Internal Server Error",
-			"application/xml",
-			nil,
-			auth_header_resp
-		)
+		return webdav_send_response(client_socket, "500 Internal Server Error", "application/xml", nil)
 	end
 
 	while true do
@@ -402,25 +443,30 @@ local function handle_copy(client_socket, path, headers)
 	src:close()
 	dst:close()
 
-	webdav_send_response(client_socket, "201 Created", "application/xml", nil, auth_header_resp)
+	webdav_send_response(client_socket, "201 Created", "application/xml", nil)
 end
 
 -- MOVE: rename or move a file
 local function handle_move(client_socket, path, headers)
-	local _, _, virtual_dir = get_root_virt_paths(path)
-	local destination = headers["destination"]
-	if not destination then
-		return webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil, auth_header_resp)
+	local src_path, src_rel = resolve_path(path)
+	if src_rel == "/" then
+		return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
 	end
 
-	local src_path = root_dir .. path
-	local dst_path = root_dir .. string.sub(destination, #virtual_dir + 1, #destination)
+	local dst_url = path_from_destination(headers["destination"])
+	if not dst_url then
+		return webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil)
+	end
+	local dst_path, dst_rel = resolve_path(dst_url)
+	if dst_rel == "/" then
+		return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
+	end
 
 	local success = os.rename(src_path, dst_path)
 	if success then
-		webdav_send_response(client_socket, "200 OK", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "200 OK", "application/xml", nil)
 	else
-		webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil)
 	end
 end
 
@@ -432,7 +478,7 @@ local function remove_recursive(target)
 	elseif mode == "directory" then
 		for entry in lfs.dir(target) do
 			if entry ~= "." and entry ~= ".." then
-				remove_recursive(target .. "/" .. entry)
+				remove_recursive(join_path(target, entry))
 			end
 		end
 		return lfs.rmdir(target)
@@ -440,43 +486,45 @@ local function remove_recursive(target)
 	return false
 end
 
--- DELETE: remove a file or directory (recursively)
+-- DELETE: remove a file or directory (recursively). Never touches root.
 local function handle_delete(client_socket, path)
-	local safe = resolve_path(path)
-	if not safe then
-		return webdav_send_response(client_socket, "400 Bad Request", "application/xml", nil, auth_header_resp)
+	local full_path, rel = resolve_path(path)
+	if rel == "/" then
+		-- Explicitly refuse to delete the root
+		return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
 	end
-	local file_path = safe:sub(2)
-	local full_path = root_dir .. "/" .. file_path
 	if not lfs.attributes(full_path) then
-		return webdav_send_response(client_socket, "404 Not Found", "application/xml", nil, auth_header_resp)
+		return webdav_send_response(client_socket, "404 Not Found", "application/xml", nil)
 	end
 	if remove_recursive(full_path) then
-		webdav_send_response(client_socket, "204 No Content", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "204 No Content", "application/xml", nil)
 	else
-		webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
 	end
 end
 
 -- Stream a file to the client (supports HTTP Range requests)
-local function webdav_download_file(file_name, client_socket, headers)
-	local file_path = root_dir .. file_name
-	local mode = lfs.attributes(file_path, "mode")
-	if mode ~= "file" then
-		local html = html_header("Error") .. [[<p>File not found: ]] .. file_path .. [[ </p>]] .. html_footer()
-		return webdav_send_response(client_socket, "200 OK", "text/html", html, auth_header_resp)
+local function webdav_download_file(path, client_socket, headers)
+	local file_path, rel = resolve_path(path)
+	if rel == "/" then
+		local html = html_header("404 Not Found") .. [[<p>Directory listing not supported</p>]] .. html_footer()
+		return webdav_send_response(client_socket, "404 Not Found", "text/html", html)
 	end
 
-	local resolved = resolve_path(file_path)
-	local file = io.open(resolved, "rb")
+	local mode = lfs.attributes(file_path, "mode")
+	if mode ~= "file" then
+		local html = html_header("404 Not Found") .. [[<p>File not found</p>]] .. html_footer()
+		return webdav_send_response(client_socket, "404 Not Found", "text/html", html)
+	end
+
+	local file = io.open(file_path, "rb")
 	if not file then
 		return client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")
 	end
 
-	local properties = get_webdav_properties(resolved)
+	local properties = get_webdav_properties(file_path)
 	local total_size = file:seek("end")
 
-	-- Parse Range header if present
 	local range_start, range_end
 	local range_header = headers and headers["range"]
 	if range_header then
@@ -501,9 +549,7 @@ local function webdav_download_file(file_name, client_socket, headers)
 		if range_start > range_end or range_start >= total_size then
 			file:close()
 			local response = "HTTP/1.1 416 Range Not Satisfiable\r\n"
-				.. "Content-Range: bytes */"
-				.. tostring(total_size)
-				.. "\r\n"
+				.. "Content-Range: bytes */" .. tostring(total_size) .. "\r\n"
 				.. "\r\n"
 			return client_socket:send(response)
 		end
@@ -523,18 +569,12 @@ local function webdav_download_file(file_name, client_socket, headers)
 	response = response .. "Content-Type: application/octet-stream\r\n"
 	response = response .. "Accept-Ranges: bytes\r\n"
 	response = response .. "Last-Modified: " .. properties.getlastmodified .. "\r\n"
-	response = response .. "Date: " .. os.date("%a, %d %b %Y %H:%M:%S GMT") .. "\r\n"
+	response = response .. "Date: " .. os.date("!%a, %d %b %Y %H:%M:%S GMT") .. "\r\n"
 	response = response .. "Server: MyWebDav\r\n"
 	response = response .. "Content-Length: " .. tostring(length) .. "\r\n"
 	if status == "206 Partial Content" then
-		response = response
-			.. "Content-Range: bytes "
-			.. tostring(start_pos)
-			.. "-"
-			.. tostring(end_pos)
-			.. "/"
-			.. tostring(total_size)
-			.. "\r\n"
+		response = response .. "Content-Range: bytes " .. tostring(start_pos)
+			.. "-" .. tostring(end_pos) .. "/" .. tostring(total_size) .. "\r\n"
 	end
 	response = response .. "\r\n"
 	client_socket:send(response)
@@ -546,7 +586,9 @@ local function webdav_download_file(file_name, client_socket, headers)
 		if not chunk then
 			break
 		end
-		client_socket:send(chunk)
+		if not client_socket:send(chunk) then
+			break
+		end
 		remaining = remaining - #chunk
 	end
 	file:close()
@@ -567,7 +609,7 @@ local function handle_request_inner(client_socket)
 		if not line or line == "" then
 			break
 		end
-		local k, v = line:match("^(.-): (.+)$")
+		local k, v = line:match("^(.-):%s*(.-)%s*$")
 		if k and v then
 			headers[k:lower()] = v
 		end
@@ -577,9 +619,7 @@ local function handle_request_inner(client_socket)
 		local allowed = "PUT, GET, COPY, MOVE, DELETE, OPTIONS, PROPFIND, MKCOL, HEAD, LOCK, UNLOCK"
 		local response = "HTTP/1.1 200 OK\r\n"
 			.. "Content-Type: text/plain\r\n"
-			.. "Allow: "
-			.. allowed
-			.. "\r\n"
+			.. "Allow: " .. allowed .. "\r\n"
 			.. "DAV: 1\r\n"
 			.. "Content-Length: 0\r\n"
 			.. "\r\n"
@@ -598,13 +638,9 @@ local function handle_request_inner(client_socket)
 		client_socket:send("HTTP/1.1 100 Continue\r\n\r\n")
 	end
 
-	if path then
-		path = url_decode(path)
-	end
-
 	if path == "/stop" then
 		local html = html_header("WebDAV server") .. [[<p>Server is shutting down. Goodbye!</p>]] .. html_footer()
-		webdav_send_response(client_socket, "200 OK", "text/html", html, auth_header_resp)
+		webdav_send_response(client_socket, "200 OK", "text/html", html)
 		webdav_forced_shutdown = true
 		webdav_stop_reason = "request"
 		return
@@ -625,59 +661,46 @@ local function handle_request_inner(client_socket)
 			webdav_download_file(path, client_socket, headers)
 		else
 			local html = html_header("Bad request.") .. [[<p>Invalid file request</p>]] .. html_footer()
-			webdav_send_response(client_socket, "400 Bad Request", "text/html", html, auth_header_resp)
+			webdav_send_response(client_socket, "400 Bad Request", "text/html", html)
 		end
 	elseif method == "HEAD" then
-		local physical_path = root_dir .. (path or "/")
-		local mode = lfs.attributes(physical_path, "mode")
+		local full_path, rel = resolve_path(path or "/")
+		local mode = lfs.attributes(full_path, "mode")
 		if not mode then
 			client_socket:send("HTTP/1.1 404 Not Found\r\n\r\n")
 		elseif mode == "file" then
-			local properties = get_webdav_properties(physical_path)
+			local properties = get_webdav_properties(full_path)
 			local response = "HTTP/1.1 200 OK\r\n"
 				.. "Content-Type: application/octet-stream\r\n"
-				.. "Last-Modified: "
-				.. properties.getlastmodified
-				.. "\r\n"
-				.. "Content-Length: "
-				.. tostring(properties.getcontentlength)
-				.. "\r\n"
+				.. "Last-Modified: " .. properties.getlastmodified .. "\r\n"
+				.. "Content-Length: " .. tostring(properties.getcontentlength) .. "\r\n"
 				.. "\r\n"
 			client_socket:send(response)
 		else
 			client_socket:send("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 		end
 	elseif method == "PUT" then
-		local file_path = path
-		local _, file_to_upload = string.match(file_path, "(.-)([^\\/]-%.?([^%.\\/]*))$")
+		local full_filename, rel = resolve_path(path)
+		if rel == "/" then
+			return webdav_send_response(client_socket, "403 Forbidden", "application/xml", nil)
+		end
 
+		local _, file_to_upload = string.match(full_filename, "(.-)([^\\/]-%.?([^%.\\/]*))$")
 		if file_to_upload and file_to_upload:lower() == "stop.txt" then
-			webdav_send_response(client_socket, "201 Created", "application/xml", nil, auth_header_resp)
+			webdav_send_response(client_socket, "201 Created", "application/xml", nil)
 			webdav_forced_shutdown = true
 			webdav_stop_reason = "request"
 			return
 		end
 
-		local full_filename = root_dir .. file_path
-		if not full_filename then
-			client_socket:send("HTTP/1.1 500 Internal Server Error\r\n\r\n")
-			return
-		end
-
 		local length = tonumber(headers["content-length"])
 		if not length then
-			return webdav_send_response(client_socket, "411 Length Required", "application/xml", nil, auth_header_resp)
+			return webdav_send_response(client_socket, "411 Length Required", "application/xml", nil)
 		end
 
 		local file = io.open(full_filename, "wb")
 		if not file then
-			return webdav_send_response(
-				client_socket,
-				"500 Internal Server Error",
-				"application/xml",
-				nil,
-				auth_header_resp
-			)
+			return webdav_send_response(client_socket, "500 Internal Server Error", "application/xml", nil)
 		end
 
 		local received = 0
@@ -689,7 +712,6 @@ local function handle_request_inner(client_socket)
 			end
 			file:write(chunk)
 			received = received + #chunk
-			-- Flush every 2 MB so the final close() is not a long stall
 			if received - last_flush >= 2 * 1024 * 1024 then
 				file:flush()
 				last_flush = received
@@ -700,18 +722,11 @@ local function handle_request_inner(client_socket)
 
 		if received < length then
 			os.remove(full_filename)
-			return webdav_send_response(
-				client_socket,
-				"500 Internal Server Error",
-				"application/xml",
-				nil,
-				auth_header_resp
-			)
+			return webdav_send_response(client_socket, "500 Internal Server Error", "application/xml", nil)
 		end
 
-		webdav_send_response(client_socket, "201 Created", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "201 Created", "application/xml", nil)
 	elseif method == "LOCK" then
-		-- Consume the request body if present (we ignore it)
 		local length = tonumber(headers["content-length"])
 		if length and length > 0 then
 			local received = 0
@@ -732,29 +747,23 @@ local function handle_request_inner(client_socket)
 			.. "<D:lockscope><D:exclusive/></D:lockscope>"
 			.. "<D:depth>infinity</D:depth>"
 			.. "<D:timeout>Second-3600</D:timeout>"
-			.. "<D:locktoken><D:href>"
-			.. lock_token
-			.. "</D:href></D:locktoken>"
+			.. "<D:locktoken><D:href>" .. lock_token .. "</D:href></D:locktoken>"
 			.. "</D:activelock>"
 			.. "</D:lockdiscovery>"
 			.. "</D:prop>"
 		local response = "HTTP/1.1 200 OK\r\n"
 			.. 'Content-Type: application/xml; charset="utf-8"\r\n'
-			.. "Lock-Token: <"
-			.. lock_token
-			.. ">\r\n"
-			.. "Content-Length: "
-			.. #xml_body
-			.. "\r\n"
+			.. "Lock-Token: <" .. lock_token .. ">\r\n"
+			.. "Content-Length: " .. #xml_body .. "\r\n"
 			.. "\r\n"
 			.. xml_body
 		client_socket:send(response)
 		return
 	elseif method == "UNLOCK" then
-		webdav_send_response(client_socket, "204 No Content", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "204 No Content", "application/xml", nil)
 		return
 	else
-		webdav_send_response(client_socket, "405 Method Not Allowed", "application/xml", nil, auth_header_resp)
+		webdav_send_response(client_socket, "405 Method Not Allowed", "application/xml", nil)
 	end
 end
 
@@ -802,14 +811,9 @@ local stop_server
 function show_server_dialog()
 	local title = _("WebDAV server is running")
 		.. "\n\n"
-		.. _("Login: ")
-		.. "http://"
-		.. tostring(webdav_parms_ip_address)
-		.. ":"
-		.. tostring(port)
+		.. _("Login: ") .. "http://" .. tostring(webdav_parms_ip_address) .. ":" .. tostring(port)
 		.. "\n"
-		.. _("User: ")
-		.. tostring(username)
+		.. _("User: ") .. tostring(username)
 
 	local dialog = ButtonDialog:new({
 		title = title,
@@ -876,7 +880,7 @@ local function refresh_timer_notification()
 		remove_timer_notification()
 		timer_notification = Notification:new({
 			text = text,
-			timeout = 1,
+			timeout = 4,
 		})
 		UIManager:show(timer_notification)
 	end
@@ -904,6 +908,22 @@ local function update_dialog_countdown()
 	UIManager:scheduleIn(1, update_dialog_countdown)
 end
 
+-- Close the Kindle firewall hole
+local function close_kindle_firewall()
+	if not kindle_firewall_open then
+		return
+	end
+	pcall(function()
+		os.execute(string.format("%s %s %s",
+			"iptables -D INPUT -p tcp --dport", port,
+			"-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
+		os.execute(string.format("%s %s %s",
+			"iptables -D OUTPUT -p tcp --sport", port,
+			"-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
+	end)
+	kindle_firewall_open = false
+end
+
 -- Stop
 function stop_server(reason)
 	if not server_running and not server_socket and not server_dialog then
@@ -928,6 +948,7 @@ function stop_server(reason)
 	end
 
 	remove_timer_notification()
+	close_kindle_firewall()
 
 	local time = os.date("*t")
 	print("Stopped at: ", os.date("%A, %m %B %Y | "), ("%02d:%02d:%02d"):format(time.hour, time.min, time.sec))
@@ -948,38 +969,47 @@ function stop_server(reason)
 	}))
 end
 
--- Non-blocking server loop, runs every 50 ms
+-- Non-blocking server loop, runs every 50 ms.
+-- The whole body is wrapped in pcall so a single error cannot kill the loop.
 local function server_tick()
 	if not server_running then
 		return
 	end
 
-	if webdav_forced_shutdown then
-		local reason = webdav_stop_reason or "button"
-		webdav_forced_shutdown = false
-		webdav_stop_reason = "timer"
-		stop_server(reason)
-		return
-	end
-
-	if os.time() >= server_stop_time then
-		stop_server("timer")
-		return
-	end
-
-	if server_socket then
-		local client_socket = server_socket:accept()
-		if client_socket then
-			client_socket:settimeout(240)
-			handle_request(client_socket)
+	local should_stop, stop_reason = false, nil
+	pcall(function()
+		if webdav_forced_shutdown then
+			should_stop = true
+			stop_reason = webdav_stop_reason or "button"
+			webdav_forced_shutdown = false
+			webdav_stop_reason = "timer"
+			return
 		end
-	end
 
-	if webdav_forced_shutdown then
-		local reason = webdav_stop_reason or "request"
-		webdav_forced_shutdown = false
-		webdav_stop_reason = "timer"
-		stop_server(reason)
+		if os.time() >= server_stop_time then
+			should_stop = true
+			stop_reason = "timer"
+			return
+		end
+
+		if server_socket then
+			local client_socket = server_socket:accept()
+			if client_socket then
+				client_socket:settimeout(240)
+				handle_request(client_socket)
+			end
+		end
+
+		if webdav_forced_shutdown then
+			should_stop = true
+			stop_reason = webdav_stop_reason or "request"
+			webdav_forced_shutdown = false
+			webdav_stop_reason = "timer"
+		end
+	end)
+
+	if should_stop then
+		stop_server(stop_reason)
 		return
 	end
 
@@ -1011,27 +1041,22 @@ local function start_server()
 		bind_addr = tostring(webdav_parms_ip_address)
 	end
 
+	-- Kindle firewall hole (not used on PocketBook)
 	if Device:isKindle() then
-		os.execute(
-			string.format(
-				"%s %s %s",
-				"iptables -A INPUT -p tcp --dport",
-				port,
-				"-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"
-			)
-		)
-		os.execute(
-			string.format(
-				"%s %s %s",
-				"iptables -A OUTPUT -p tcp --sport",
-				port,
-				"-m conntrack --ctstate ESTABLISHED -j ACCEPT"
-			)
-		)
+		pcall(function()
+			os.execute(string.format("%s %s %s",
+				"iptables -A INPUT -p tcp --dport", port,
+				"-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
+			os.execute(string.format("%s %s %s",
+				"iptables -A OUTPUT -p tcp --sport", port,
+				"-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
+		end)
+		kindle_firewall_open = true
 	end
 
 	local ok, sock_or_err = pcall(socket.bind, bind_addr, port)
 	if not ok or not sock_or_err then
+		close_kindle_firewall()
 		UIManager:show(Notification:new({
 			text = user_ip_enabled and _("Failed to bind to the manual IP. Check the address.")
 				or _("Failed to start server: port busy?"),
@@ -1082,8 +1107,6 @@ function MyWebDav:addToMainMenu(menu_items)
 	local webdav_parms = G_reader_settings:readSetting("webdav_parms")
 	local webdav_parms_port, webdav_seconds_run, webdav_username, webdav_password
 
-	-- In manual mode the user-supplied IP is authoritative.
-	-- In auto mode we hit the network when Wi-Fi is on.
 	if not user_ip_enabled and is_wifi_on() then
 		webdav_check_socket()
 		if real_ip and real_ip ~= "127.0.0.1" and real_ip ~= "0.0.0.0" then
@@ -1232,7 +1255,7 @@ function MyWebDav:addToMainMenu(menu_items)
 					end
 				end,
 			},
-			-- 5. Settings (IP only in manual mode)
+			-- 4. Settings (IP only in manual mode)
 			{
 				text = _("Settings"),
 				keep_menu_open = true,
@@ -1311,7 +1334,7 @@ function MyWebDav:addToMainMenu(menu_items)
 
 										local new_port = tonumber(get[idx])
 										idx = idx + 1
-										if not new_port or new_port < 1 or new_port > 65355 then
+										if not new_port or new_port < 1 or new_port > 65535 then
 											new_port = 8080
 										end
 
@@ -1352,6 +1375,9 @@ function MyWebDav:addToMainMenu(menu_items)
 											username = new_username,
 											password = new_password,
 										})
+										pcall(function()
+											G_reader_settings:flush()
+										end)
 
 										UIManager:close(url_dialog)
 										MyWebDav:onUpdateWebDavSettings()
@@ -1372,7 +1398,6 @@ function MyWebDav:addToMainMenu(menu_items)
 				text = _("QR code for login"),
 				keep_menu_open = true,
 				callback = function()
-					-- Refresh IP right before showing the QR, unless manual mode
 					if not user_ip_enabled and is_wifi_on() then
 						webdav_check_socket()
 						if real_ip and real_ip ~= "127.0.0.1" and real_ip ~= "0.0.0.0" then
@@ -1393,11 +1418,8 @@ function MyWebDav:addToMainMenu(menu_items)
 					local mode = user_ip_enabled and _("manual") or _("auto")
 					return _("Login at http://")
 						.. tostring(webdav_parms_ip_address)
-						.. ":"
-						.. tostring(port)
-						.. "  ("
-						.. mode
-						.. ")"
+						.. ":" .. tostring(port)
+						.. "  (" .. mode .. ")"
 				end,
 				enabled = false,
 			},
@@ -1406,12 +1428,27 @@ function MyWebDav:addToMainMenu(menu_items)
 end
 
 function MyWebDav:onMyWebDav()
-	UIManager:show(InfoMessage:new({
-		text = _("Starting a WebDav Server"),
-	}))
+	if not is_wifi_on() then
+		UIManager:show(InfoMessage:new({
+			text = _("Wi-Fi is off. Turn it on to start the server."),
+		}))
+		return
+	end
+
+	local low, capacity = is_battery_low(20)
+	if low then
+		UIManager:show(Notification:new({
+			text = _("Battery below ") .. tostring(capacity) .. _(
+				"% — server may be unstable. Charge the device."
+			),
+			timeout = 5,
+		}))
+	end
+
+	start_server()
 end
 
-function MyWebDav:AutoStopServer()
+function MyWebDav:onAutoStopServer()
 	local text_part = "automatically"
 	if webdav_forced_shutdown == true then
 		text_part = "manually"
@@ -1427,28 +1464,31 @@ function MyWebDav:onUpdateWebDavSettings()
 	}))
 end
 
--- IP detection
+-- IP detection: use UDP setpeername trick (no packets sent, no blocking).
 function webdav_check_socket()
 	real_ip = nil
 
-	local t = socket.tcp()
-	if t then
-		t:settimeout(0.5)
-		t:connect("1.1.1.1", 80)
-		t:connect("8.8.8.8", 80)
-		local ip, _, ip_type = t:getsockname()
-		t:close()
-		if ip and ip_type == "inet" and ip ~= "0.0.0.0" and ip ~= "127.0.0.1" then
-			real_ip = ip
-		end
+	-- Method 1: UDP peer assignment forces the OS to pick the outgoing interface
+	local ok_udp, s = pcall(socket.udp)
+	if ok_udp and s then
+		pcall(function()
+			s:setpeername("8.8.8.8", 53)
+			local ip = s:getsockname()
+			if ip and ip ~= "0.0.0.0" and ip ~= "127.0.0.1" then
+				real_ip = ip
+			end
+		end)
+		pcall(function() s:close() end)
 	end
 
+	-- Method 2: fall back to ifconfig output
 	if not real_ip then
 		local f = io.popen("ifconfig 2>/dev/null")
 		if f then
 			local out = f:read("*a")
 			f:close()
-			local ip = out:match("inet%s+addr:%s*(%d+%.%d+%.%d+%.%d+)") or out:match("inet%s+(%d+%.%d+%.%d+%.%d+)")
+			local ip = out:match("inet%s+addr:%s*(%d+%.%d+%.%d+%.%d+)")
+				or out:match("inet%s+(%d+%.%d+%.%d+%.%d+)")
 			if ip and ip ~= "127.0.0.1" then
 				real_ip = ip
 			end
@@ -1475,7 +1515,7 @@ if G_reader_settings:hasNot("webdav_parms") then
 		seconds_runtime = tonumber(default_seconds_runtime),
 		username = tostring(default_username),
 		password = tostring(default_password),
-		root_dir = "/mnt/onboard",
+		root_dir = "/mnt/ext1",
 	})
 end
 
@@ -1484,10 +1524,10 @@ if G_reader_settings:has("webdav_parms") then
 	if webdav_parms then
 		webdav_parms_ip_address = tostring(webdav_parms["ip_address"] or real_ip)
 		user_ip_enabled = webdav_parms["user_ip_enabled"] == true
-		port = tonumber(webdav_parms["port"])
-		seconds_runtime = tonumber(webdav_parms["seconds_runtime"])
-		username = tostring(webdav_parms["username"])
-		password = tostring(webdav_parms["password"])
+		port = tonumber(webdav_parms["port"]) or 8080
+		seconds_runtime = tonumber(webdav_parms["seconds_runtime"]) or 60
+		username = tostring(webdav_parms["username"] or "admin")
+		password = tostring(webdav_parms["password"] or "1234")
 		if webdav_parms["root_dir"] and webdav_parms["root_dir"] ~= "" then
 			root_dir = tostring(webdav_parms["root_dir"])
 		end
@@ -1495,12 +1535,9 @@ if G_reader_settings:has("webdav_parms") then
 end
 
 print(
-	"Defaults: ip: "
-		.. tostring(real_ip)
-		.. ", port: "
-		.. tostring(port)
-		.. ", runtime (seconds): "
-		.. tostring(seconds_runtime)
+	"Defaults: ip: " .. tostring(real_ip)
+		.. ", port: " .. tostring(port)
+		.. ", runtime (seconds): " .. tostring(seconds_runtime)
 )
 
 return MyWebDav

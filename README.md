@@ -9,9 +9,9 @@ They are below in this document/on this page.
 
 INTRODUCTION
 
-This WEBDAV SERVER plugin allows you to use any Webdav client App or File Explorers with Webdav support to browse through the content of the Home folder of your device running KOReader. You can wirelessly (only via Wifi) upload, download, delete, copy and move eBooks and any type of files. You can also create a new folder and delete a folder after first deleting the content in that folder.
+This WEBDAV SERVER plugin allows you to use any Webdav client App or File Explorers with Webdav support to browse through the content of the Root folder of your device running KOReader. You can wirelessly (only via Wifi) upload, download, delete, copy and move eBooks and any type of files. You can also create a new folder, and you can delete a folder WITH all its content in one go (recursive delete).
 
-The default is Login username is "admin" with password "1234" (without the double quotes!).
+The default Login username is "admin" with password "1234" (without the double quotes!).
 
 RECOMMENDED WEBDAV CLIENTS 
 NOTE: if you have problems then try another Webdav client. I had for example problems with WinSCP while Cyberduck worked fine on Windows 11.
@@ -27,30 +27,34 @@ On All devices: KOReader, yes it has a WebDav client that you might already use:
 If you use KOReader on Android you can access ebooks that are located on your ereader which runs KOreader with the Webdav Server!
 
 
-The starting point after login is a view of all content in the Home folder that you have chosen and set in you KOReader. Their is an exception: hidden files and folders ending with their name as .sdr are NOT shown at all.
+The starting point after login is a view of all content in the Root folder that you have chosen and set in your KOReader. There is one exception: hidden files and folders, and folders ending with .sdr, are NOT shown at all.
 
 If your KOReader is running on the same device as where Calibre is running then you might see the folder structure that Calibre uses.
-In the screen prints in github you will see examples of such structure. Note: the structure on you KOReader might be different.
-For example when sending ebooks with default settings from Calibre to a KOBO device the structure will look like Home folder > Author folder > eBook files such as epub, kepub.epub, pdf and so on.
+In the screen prints in github you will see examples of such structure. Note: the structure on your KOReader might be different.
+For example when sending ebooks with default settings from Calibre to a KOBO device the structure will look like Root folder > Author folder > eBook files such as epub, kepub.epub, pdf and so on.
 
 
 Upload happens wirelessly via your home Wifi or via the Hotspot on your phone or via any network as long as the device with the Browser and the device with KOReader can connect to each other over the same LAN. The connection is over HTTP only on the port number set in the plugin. 
 The plugin has a function to generate a QRcode for the Login on your smart phone or PC for example. 
 An own defined username and password can be set as well. 
 
-Before starting the plugin make sure Wifi is ON and the device with KOreader is connected to your LAN.
-That is required in order to obtain an IP address which is used to make a connection from a browser to your device. 
+Before starting the plugin make sure Wifi is ON and the device with KOReader is connected to your LAN.
+That is required in order to obtain an IP address which is used to make a connection from a browser to your device.
+The plugin automatically checks that Wifi is on and refuses to start if it is off, so you don't get stuck with an unreachable server.
 
 The plugin starts a webdav server on the KOReader device at the defined port (default 8080). 
-That webdav server runs for the number op seconds you have set (default 60 seconds = 1 min maximum 15 min) and stops automatically to save you a battery drain! 
-You can also manually Stop the Wedav Server via a Webdav client. This overrules the runtime. 
+That webdav server runs for the number of seconds you have set (default 60 seconds = 1 min, maximum 15 min) and stops automatically to save your battery! 
+You can enter the runtime either as seconds (e.g. 600) or as MM:SS (e.g. 12:30). The allowed range is 30–900 seconds.
+While the server is running, a small notification at the top of the screen shows a live countdown of the remaining time.
+
+You can also manually Stop the Webdav Server via a Webdav client. This overrules the runtime. 
 You do this as follows:
 - enter /stop after the url http://<ip-address-webdavserver>:8080  So it should look like: http://192.168.1.11:8080/stop
 OR
 - upload, copy or move a file with the name: stop.txt. 
   The file itself will not be uploaded, copied or moved. The Webdav server stops immediately
 
-ebooks will appear automatically in the folder that you have set as Home folder. 
+ebooks will appear automatically in the folder that you have set as Root folder. 
 So that could be any folder that KOReader can access on the device and that provides write access.
 
 BTW: this is not an wireless upload via VPN or a third party... Nobody else is needed or involved. Just you and your LAN. 
@@ -58,14 +62,30 @@ If you use the standard available Hotspot function of the smart phone of your fr
 
 See the github folder with the screen prints to get an overview.
 
+FEATURES
+
+- Non-blocking server loop, so the KOReader UI stays responsive while the server is running.
+- Blocking dialog with a Stop button, so you can always shut the server down cleanly.
+- Live countdown notification with the remaining time.
+- Runtime can be entered in seconds (600) or in MM:SS format (12:30). Range 30–900 s.
+- Wi-Fi check before start: the plugin will not start if Wi-Fi is off.
+- Low battery warning: if the battery is below 20% you will be warned before starting.
+- Manual IP mode (optional): you can override the auto-detected IP address.
+- Basic authentication (RFC 7617) for protecting your files.
+- HTTP Range support for downloads, so large files can be downloaded in chunks and resume is possible.
+- Recursive DELETE for folders.
+- LOCK / UNLOCK stubs for compatibility with clients that request them.
+
 This plugin was developed on Ubuntu 24 and works on Ubuntu 24, Raspberry Pi 4 with Bookworm and Samsung/Android Smartphones when KOReader is installed.
-It should also work on KOBO and from version 1.1 probably also on Kindle. Note: Kindle has a firewall installed that blocked previous versions of this Plugin. By adding a firewall rule I hope that it will work on Kindle as well. However I am not sure as I cannot test that.
+It should also work on KOBO, PocketBook, and from version 1.1 probably also on Kindle.
+Note: PocketBook compatibility and general UI stability have been significantly improved in version 1.4.
+Kindle has a firewall installed that blocked previous versions of this Plugin. By adding a firewall rule I hope that it will work on Kindle as well. However I am not sure as I cannot test that.
 
 
 WHAT TO DO IF YOU CANNOT ACCESS FROM A WEBDAV CLIENT THE WEBDAV SERVER? 
 
 Check the following points:
-1. Is Wifi ON? -> Switch on Wifi
+1. Is Wifi ON? -> Switch on Wifi. The plugin itself will refuse to start without Wifi, but check anyway.
 2. Is device connected to the LAN? -> Login to your LAN with the KOReader device as an IP is required. Check IP
 3. Is Plugin Settings menu function NOT showing your LAN IP but just 127.0.0.1? -> Use Plugin menu Reset function, Restart KOReader or the device when needed and check Steps 1 and 2 after a restart!
 4. Is the Upload Server running? -> Your Menu should be blocked else (re-)start the WebDav Server
@@ -120,8 +140,15 @@ version: 1.3
 - The ENTRY NEW: WebDav server has been moved under the Clogs icon , Network!. Word NEW is then dropped!
 
 version: 1.4
- - Fixes for password saving, UI freeze, large PUT timeouts, PROPFIND/DELETE/HEAD, plus Range/Depth/LOCK support - #2
-   Many thanks to TvariKot who brought all these improvements and was so kind to let me merge this and I adapted a few small things like connection time out now 240 for large libraries and default root directory is /mnt/onboard  (Kobo's default) ! 
-
-IMPORTANT: Uploading a file which has a name with "#" in it will fail with an error message. However the file will be still uploaded but with a truncated name! Only the characters before the # (hash) are used in the new filename.  So "My Example #001 file.epub"  will become "My Example " on your device.
-   
+- Fixed an issue where the password was not saved correctly in the settings.
+- Fixed UI freezes and interface hangs during server operation.
+- Improved stability and compatibility for PocketBook devices.
+- Code refactoring for better maintainability (no functional changes).
+- Runtime now accepts MM:SS in addition to plain seconds.
+- Added Wi-Fi check before start.
+- Added low-battery warning (< 20%).
+- Added live countdown notification with remaining time.
+- Added optional Manual IP mode.
+- Added HTTP Range support for downloads.
+- Added recursive DELETE for folders.
+- Added LOCK / UNLOCK stubs for client compatibility.
